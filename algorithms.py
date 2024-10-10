@@ -15,6 +15,11 @@ from scipy.signal import savgol_filter, lfilter
 from model.model import LSTMModel
 import torch
 import math
+import os
+from signalr_client import signalr_client
+from datetime import datetime
+import uuid
+import json
 
 
 def get_source(args):
@@ -123,9 +128,6 @@ def extract_keypoints_parallel(queue, args, self_counter, other_counter, consecu
 
     queue.put(None)
     return
-
-
-###################################################### Post human estimation ###########################################################
 
 
 def show_tracked_img(img_dict, ip_set, num_matched, output_video, args):
@@ -238,9 +240,24 @@ def match_unmatched(unmatched_1, unmatched_2, lstm_set1, lstm_set2, num_matched)
     return final_pairs, new_matched_1, new_matched_2, new_lstm1, new_lstm2
 
 
+def send_alert_message(camera_index, video_filename):
+    """Send an alert message to the server."""
+    current_datetime = datetime.now()
+    alert_data = {
+        "messageType": "fall_detection_service",
+        "id": uuid.uuid4().hex,
+        "date": current_datetime.strftime("%Y-%m-%d"),
+        "time": current_datetime.strftime("%H:%M:%S"),
+        "location": "Location A",
+        "cameraId": f"Camera-{camera_index}",
+        "alertMessage": "Fall detected at Location A",
+        "attached": [video_filename],
+    }
+    signalr_client.send_message(json.dumps(alert_data))
+
 def alg2_sequential(queues, argss, consecutive_frames, event):
     model = LSTMModel(h_RNN=48, h_RNN_layers=2, drop_p=0.1, num_classes=7)
-    model.load_state_dict(torch.load('model/lstm_weights.sav',map_location=argss[0].device))
+    model.load_state_dict(torch.load('model/lstm_weights.sav', map_location=argss[0].device))
     model.eval()
     output_videos = [None for _ in range(argss[0].num_cams)]
     t0 = time.time()
@@ -249,16 +266,25 @@ def alg2_sequential(queues, argss, consecutive_frames, event):
     lstm_sets = [[] for _ in range(argss[0].num_cams)]
     max_length_mat = 300
     num_matched = 0
+    buffer_size = 90
+    frame_buffers = [[] for _ in range(argss[0].num_cams)]
+    video_writers = [None for _ in range(argss[0].num_cams)]
+    
     if not argss[0].plot_graph:
         max_length_mat = consecutive_frames
     else:
         f, ax = plt.subplots()
         move_figure(f, 800, 100)
-    window_names = [args.video if isinstance(args.video, str) else 'Cam '+str(args.video) for args in argss]
+        
+    window_names = [args.video if isinstance(args.video, str) else 'Cam ' + str(args.video) for args in argss]
     [cv2.namedWindow(window_name) for window_name in window_names]
-    while True:
 
-        # if not queue1.empty() and not queue2.empty():
+    save_dir = "saved_falls"
+    os.makedirs(save_dir, exist_ok=True)
+
+    fourcc = cv2.VideoWriter_fourcc(*'avc1')
+
+    while True:
         if not any(q.empty() for q in queues):
             dict_frames = [q.get() for q in queues]
 
@@ -272,133 +298,57 @@ def alg2_sequential(queues, argss, consecutive_frames, event):
                     event.set()
 
             kp_frames = [dict_frame["keypoint_sets"] for dict_frame in dict_frames]
-            if argss[0].num_cams == 1:
-                num_matched, new_num, indxs_unmatched = match_ip(ip_sets[0], kp_frames[0], lstm_sets[0], num_matched, max_length_mat)
-                valid1_idxs, prediction = get_all_features(ip_sets[0], lstm_sets[0], model)
-                dict_frames[0]["tagged_df"]["text"] += f" Pred: {activity_dict[prediction+5]}"
-                img, output_videos[0] = show_tracked_img(dict_frames[0], ip_sets[0], num_matched, output_videos[0], argss[0])
-                # print(img1.shape)
-                cv2.imshow(window_names[0], img)
 
-            elif argss[0].num_cams == 2:
-                num_matched, new_num, indxs_unmatched1 = match_ip(ip_sets[0], kp_frames[0], lstm_sets[0], num_matched, max_length_mat)
-                assert(new_num == len(ip_sets[0]))
-                for i in sorted(indxs_unmatched1, reverse=True):
-                    elem = ip_sets[1][i]
-                    ip_sets[1].pop(i)
-                    ip_sets[1].append(elem)
-                    elem_lstm = lstm_sets[1][i]
-                    lstm_sets[1].pop(i)
-                    lstm_sets[1].append(elem_lstm)
-                num_matched, new_num, indxs_unmatched2 = match_ip(ip_sets[1], kp_frames[1], lstm_sets[1], num_matched, max_length_mat)
+            for cam_idx in range(argss[0].num_cams):
+                num_matched, new_num, indxs_unmatched = match_ip(ip_sets[cam_idx], kp_frames[cam_idx], lstm_sets[cam_idx], num_matched, max_length_mat)
+                valid_idxs, prediction = get_all_features(ip_sets[cam_idx], lstm_sets[cam_idx], model)
+                dict_frames[cam_idx]["tagged_df"]["text"] += f" Pred: {activity_dict[prediction + 5]}"
+                img, output_videos[cam_idx] = show_tracked_img(dict_frames[cam_idx], ip_sets[cam_idx], num_matched, output_videos[cam_idx], argss[cam_idx])
+                
+                frame_buffers[cam_idx].append(img)
+                if len(frame_buffers[cam_idx]) > buffer_size:
+                    frame_buffers[cam_idx].pop(0)  # Keep buffer size constant
 
-                for i in sorted(indxs_unmatched2, reverse=True):
-                    elem = ip_sets[0][i]
-                    ip_sets[0].pop(i)
-                    ip_sets[0].append(elem)
-                    elem_lstm = lstm_sets[0][i]
-                    lstm_sets[0].pop(i)
-                    lstm_sets[0].append(elem_lstm)
+                # Check for fall detection
+                if prediction in [3, 4, 5]:
+                    if video_writers[cam_idx] is None:
+                        # Start recording the video
+                        fn = f"detected_fall_cam{cam_idx}_{time.time()}.mp4"
+                        video_filename = f"{save_dir}/{fn}"
+                        video_writers[cam_idx] = cv2.VideoWriter(video_filename, fourcc, 30, (img.shape[1], img.shape[0]))
+                        print(f"Started recording fall detection video: {video_filename}")
 
-                matched_1 = ip_sets[0][:num_matched]
-                matched_2 = ip_sets[1][:num_matched]
+                    for buffered_frame in frame_buffers[cam_idx]:
+                        video_writers[cam_idx].write(buffered_frame)
 
-                unmatch_previous = remove_wrongly_matched(matched_1, matched_2)
-                if unmatch_previous:
-                    print(unmatch_previous)
+                    video_writers[cam_idx].write(img)
 
-                for i in sorted(unmatch_previous, reverse=True):
-                    elem1 = ip_sets[0][i]
-                    elem2 = ip_sets[1][i]
-                    ip_sets[0].pop(i)
-                    ip_sets[1].pop(i)
-                    ip_sets[0].append(elem1)
-                    ip_sets[1].append(elem2)
-                    elem_lstm1 = lstm_sets[0][i]
-                    lstm_sets[0].pop(i)
-                    lstm_sets[0].append(elem_lstm1)
-                    elem_lstm2 = lstm_sets[1][i]
-                    lstm_sets[1].pop(i)
-                    lstm_sets[1].append(elem_lstm2)
-                    num_matched -= 1
+                else:
+                    if video_writers[cam_idx] is not None:
+                        # Stop recording the video
+                        print(f"Stopped recording fall detection video for camera {cam_idx}")
+                        video_writers[cam_idx].release()
+                        video_writers[cam_idx] = None
+                        frame_buffers[cam_idx] = []  # Clear the buffer after saving the video
+                        
+                        # Send alert message for the finished video
+                        send_alert_message(cam_idx, fn)
 
-                unmatched_1 = ip_sets[0][num_matched:]
-                unmatched_2 = ip_sets[1][num_matched:]
+                cv2.imshow(window_names[cam_idx], img)
 
-                new_pairs, new_matched1, new_matched2, new_lstm1, new_lstm2 = match_unmatched(
-                    unmatched_1, unmatched_2, lstm_sets[0], lstm_sets[1], num_matched)
+            for cam_idx in range(argss[0].num_cams):
+                assert len(lstm_sets[cam_idx]) == len(ip_sets[cam_idx])
 
-                new_p1 = new_pairs[0]
-                new_p2 = new_pairs[1]
-
-                for i in sorted(new_p1, reverse=True):
-                    ip_sets[0].pop(i)
-                    lstm_sets[0].pop(i)
-                for i in sorted(new_p2, reverse=True):
-                    ip_sets[1].pop(i)
-                    lstm_sets[1].pop(i)
-
-                ip_sets[0] = ip_sets[0][:num_matched] + new_matched1 + ip_sets[0][num_matched:]
-                ip_sets[1] = ip_sets[1][:num_matched] + new_matched2 + ip_sets[1][num_matched:]
-                lstm_sets[0] = lstm_sets[0][:num_matched] + new_lstm1 + lstm_sets[0][num_matched:]
-                lstm_sets[1] = lstm_sets[1][:num_matched] + new_lstm2 + lstm_sets[1][num_matched:]
-                # remember to match the energy matrices also
-
-                num_matched = num_matched + len(new_matched1)
-
-                # get features now
-
-                valid1_idxs, prediction1 = get_all_features(ip_sets[0], lstm_sets[0], model)
-                valid2_idxs, prediction2 = get_all_features(ip_sets[1], lstm_sets[1], model)
-                dict_frames[0]["tagged_df"]["text"] += f" Pred: {activity_dict[prediction1+5]}"
-                dict_frames[1]["tagged_df"]["text"] += f" Pred: {activity_dict[prediction2+5]}"
-                img1, output_videos[0] = show_tracked_img(dict_frames[0], ip_sets[0], num_matched, output_videos[0], argss[0])
-                img2, output_videos[1] = show_tracked_img(dict_frames[1], ip_sets[1], num_matched, output_videos[1], argss[1])
-                # print(img1.shape)
-                cv2.imshow(window_names[0], img1)
-                cv2.imshow(window_names[1], img2)
-
-                assert(len(lstm_sets[0]) == len(ip_sets[0]))
-                assert(len(lstm_sets[1]) == len(ip_sets[1]))
-
-            DEBUG = False
-            # for ip_set, feature_plotter in zip(ip_sets, feature_plotters):
-            #     for cnt in range(len(FEATURE_LIST)):
-            #         plt_f = FEATURE_LIST[cnt]
-            #         if ip_set and ip_set[0] is not None and ip_set[0][-1] is not None and plt_f in ip_set[0][-1]["features"]:
-            #             # print(ip_set[0][-1]["features"])
-            #             feature_plotter[cnt].append(ip_set[0][-1]["features"][plt_f])
-            #
-            #         else:
-            #             # print("None")
-            #             feature_plotter[cnt].append(0)
-            # DEBUG = True
+    # Ensure all videos are released and sent at the end
+    for cam_idx in range(argss[0].num_cams):
+        if video_writers[cam_idx] is not None:
+            # Release and send any videos still being written
+            print(f"Stopped recording fall detection video for camera {cam_idx} at the end")
+            video_writers[cam_idx].release()
+            send_alert_message(cam_idx, fn)  # Send alert for the last video
+            frame_buffers[cam_idx] = []  # Clear buffer
 
     cv2.destroyAllWindows()
-    # for feature_plotter in feature_plotters:
-    #     for i, feature_arr in enumerate(feature_plotter):
-    #         plt.clf()
-    #         x = np.linspace(1, len(feature_arr), len(feature_arr))
-    #         axes = plt.gca()
-    #         filter_array = feature_arr
-    #         line, = axes.plot(x, filter_array, 'r-')
-    #         plt.ylabel(FEATURE_LIST[i])
-    #         # #plt.savefig(f'{args1.video}_{FEATURE_LIST[i]}_filter.png')
-    #         plt.pause(1e-7)
-
-    # for i, feature_arr in enumerate(feature_plotter2):
-    #     plt.clf()
-    #     x = np.linspace(1, len(feature_arr), len(feature_arr))
-    #     axes = plt.gca()
-    #     filter_array = feature_arr
-    #     line, = axes.plot(x, filter_array, 'r-')
-    #     plt.ylabel(FEATURE_LIST[i])
-    #     # plt.savefig(f'{args2.video}_{FEATURE_LIST[i]}_filter.png')
-    #     plt.pause(1e-7)
-    #     # if len(re_matrix1[0]) > 0:
-    #     #     print(np.linalg.norm(ip_sets[0][0][-1][0]['B']-ip_sets[0][0][-1][0]['H']))
-
-    # print("P2 Over")
     del model
     return
 
@@ -407,8 +357,6 @@ def get_all_features(ip_set, lstm_set, model):
     valid_idxs = []
     invalid_idxs = []
     predictions = [15]*len(ip_set)  # 15 is the tag for None
-
-    fall_predictions = [1.0, 2.0, 3, 4, 5]
 
     for i, ips in enumerate(ip_set):
         # ip set for a particular person
@@ -467,10 +415,6 @@ def get_all_features(ip_set, lstm_set, model):
         outputs, lstm_set[i][0] = model(xdata, lstm_set[i][0])
         if i == 0:
             prediction = torch.max(outputs.data, 1)[1][0].item()
-#test
-            if prediction in fall_predictions:
-                print("Fall detected")
-#test
             confidence = torch.max(outputs.data, 1)[0][0].item()
             fpd = True
             # fpd = False
