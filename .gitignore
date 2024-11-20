@@ -6,3 +6,5 @@ Fall_Detection_Documents/
 *.avi
 examples
 saved_falls
+
+fall_detector_env

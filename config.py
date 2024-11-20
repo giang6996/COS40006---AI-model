@@ -1,1 +1,1 @@
-SIGNAL_R_URL = 'wss://192.168.1.5:8001/api/fail-detection-hub'
+SIGNAL_R_URL = 'wss://localhost:7205/api/fail-detection-hub'

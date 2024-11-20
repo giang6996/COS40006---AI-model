@@ -10,6 +10,8 @@ from algorithms import *
 from helpers import last_ip
 import os
 import matplotlib.pyplot as plt
+import requests
+import datetime
 
 try:
     mp.set_start_method('spawn')
@@ -143,7 +145,7 @@ class FallDetector:
             process2.join()
         print('Exiting...')
         return
-
+    
 
 if __name__ == "__main__":
     f = FallDetector()

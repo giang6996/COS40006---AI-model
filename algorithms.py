@@ -1,4 +1,5 @@
 import cv2
+import os
 import logging
 import base64
 import time
@@ -20,7 +21,11 @@ from signalr_client import signalr_client
 from datetime import datetime
 import uuid
 import json
+import requests
+from datetime import datetime
 
+
+VIDEO_DIRECTORY = "../HumanFallDetection/saved_falls"
 
 def get_source(args):
     tagged_df = None
@@ -243,6 +248,7 @@ def match_unmatched(unmatched_1, unmatched_2, lstm_set1, lstm_set2, num_matched)
 def send_alert_message(camera_index, video_filename):
     """Send an alert message to the server."""
     current_datetime = datetime.now()
+    
     alert_data = {
         "messageType": "fall_detection_service",
         "id": uuid.uuid4().hex,
@@ -253,6 +259,30 @@ def send_alert_message(camera_index, video_filename):
         "alertMessage": "Fall detected at Location A",
         "attached": [video_filename],
     }
+    
+    signalr_client.send_message(alert_data)
+    
+    requests.post("http://localhost:5000/trigger-notification", json={
+        "type": "fall_detection",
+        "message": f"Fall detected on {alert_data['cameraId']} at Location A"
+    })
+    
+    metadata_path = os.path.join(VIDEO_DIRECTORY, 'fall_metadata.json')
+    
+    # Check if metadata file exists; if not, create it
+    if os.path.exists(metadata_path):
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+    else:
+        metadata = []
+    
+    # Append the new alert data to the existing metadata
+    metadata.append(alert_data)
+    
+    # Save the updated metadata to the file
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f, indent=4)
+    
     signalr_client.send_message(json.dumps(alert_data))
 
 def alg2_sequential(queues, argss, consecutive_frames, event):
